@@ -9,7 +9,7 @@ const moment = require('moment')
 const graphHelper = require('../../helpers/graph')
 const request = require('request-promise')
 const crypto = require('crypto')
-const nanoid = require('nanoid/non-secure/generate')
+const nanoid = require('nanoid/non-secure').customAlphabet('1234567890abcdef', 10)
 
 /* global WIKI */
 
@@ -34,7 +34,22 @@ module.exports = {
         result.push({ key, value })
       }, [])
     },
-    async info() { return {} }
+    async info () { return {} },
+    async extensions () {
+      const exts = Object.values(WIKI.extensions.ext).map(ext => _.pick(ext, ['key', 'title', 'description', 'isInstalled']))
+      for (let ext of exts) {
+        ext.isCompatible = await WIKI.extensions.ext[ext.key].isCompatible()
+      }
+      return exts
+    },
+    async exportStatus () {
+      return {
+        status: WIKI.system.exportStatus.status,
+        progress: Math.ceil(WIKI.system.exportStatus.progress),
+        message: WIKI.system.exportStatus.message,
+        startedAt: WIKI.system.exportStatus.startedAt
+      }
+    }
   },
   SystemMutation: {
     async updateFlags (obj, args, context) {
@@ -75,7 +90,10 @@ module.exports = {
         if (process.env.UPGRADE_COMPANION) {
           await request({
             method: 'POST',
-            uri: 'http://wiki-update-companion/upgrade'
+            uri: 'http://wiki-update-companion/upgrade',
+            qs: {
+              ...process.env.UPGRADE_COMPANION_REF && { container: process.env.UPGRADE_COMPANION_REF }
+            }
           })
           return {
             responseResult: graphHelper.generateSuccess('Upgrade has started.')
@@ -150,7 +168,7 @@ module.exports = {
                       roles = _.concat(roles, ['write:pages', 'manage:pages', 'read:source', 'read:history', 'write:assets', 'manage:assets'])
                     }
                     return {
-                      id: nanoid('1234567890abcdef', 10),
+                      id: nanoid(),
                       roles: roles,
                       match: r.exact ? 'EXACT' : 'START',
                       deny: r.deny,
@@ -205,6 +223,7 @@ module.exports = {
 
           if (args.groupMode !== `NONE`) {
             await WIKI.auth.reloadGroups()
+            WIKI.events.outbound.emit('reloadGroups')
           }
 
           client.close()
@@ -216,6 +235,71 @@ module.exports = {
           }
         } else {
           throw new Error('MongoDB Connection String is missing or invalid.')
+        }
+      } catch (err) {
+        return graphHelper.generateError(err)
+      }
+    },
+    /**
+     * Set HTTPS Redirection State
+     */
+    async setHTTPSRedirection (obj, args, context) {
+      _.set(WIKI.config, 'server.sslRedir', args.enabled)
+      await WIKI.configSvc.saveToDb(['server'])
+      return {
+        responseResult: graphHelper.generateSuccess('HTTP Redirection state set successfully.')
+      }
+    },
+    /**
+     * Renew SSL Certificate
+     */
+    async renewHTTPSCertificate (obj, args, context) {
+      try {
+        if (!WIKI.config.ssl.enabled) {
+          throw new WIKI.Error.SystemSSLDisabled()
+        } else if (WIKI.config.ssl.provider !== `letsencrypt`) {
+          throw new WIKI.Error.SystemSSLRenewInvalidProvider()
+        } else if (!WIKI.servers.le) {
+          throw new WIKI.Error.SystemSSLLEUnavailable()
+        } else {
+          await WIKI.servers.le.requestCertificate()
+          await WIKI.servers.restartServer('https')
+          return {
+            responseResult: graphHelper.generateSuccess('SSL Certificate renewed successfully.')
+          }
+        }
+      } catch (err) {
+        return graphHelper.generateError(err)
+      }
+    },
+
+    /**
+     * Export Wiki to Disk
+     */
+    async export (obj, args, context) {
+      try {
+        const desiredPath = path.resolve(WIKI.ROOTPATH, args.path)
+        // -> Check if export process is already running
+        if (WIKI.system.exportStatus.status === 'running') {
+          throw new Error('Another export is already running.')
+        }
+        // -> Validate entities
+        if (args.entities.length < 1) {
+          throw new Error('Must specify at least 1 entity to export.')
+        }
+        // -> Check target path
+        await fs.ensureDir(desiredPath)
+        const existingFiles = await fs.readdir(desiredPath)
+        if (existingFiles.length) {
+          throw new Error('Target directory must be empty!')
+        }
+        // -> Start export
+        WIKI.system.export({
+          entities: args.entities,
+          path: desiredPath
+        })
+        return {
+          responseResult: graphHelper.generateSuccess('Export started successfully.')
         }
       } catch (err) {
         return graphHelper.generateError(err)
@@ -266,6 +350,15 @@ module.exports = {
     hostname () {
       return os.hostname()
     },
+    httpPort () {
+      return WIKI.servers.servers.http ? _.get(WIKI.servers.servers.http.address(), 'port', 0) : 0
+    },
+    httpRedirection () {
+      return _.get(WIKI.config, 'server.sslRedir', false)
+    },
+    httpsPort () {
+      return WIKI.servers.servers.https ? _.get(WIKI.servers.servers.https.address(), 'port', 0) : 0
+    },
     latestVersion () {
       return WIKI.system.updates.version
     },
@@ -293,6 +386,21 @@ module.exports = {
     ramTotal () {
       return filesize(os.totalmem())
     },
+    sslDomain () {
+      return WIKI.config.ssl.enabled && WIKI.config.ssl.provider === `letsencrypt` ? WIKI.config.ssl.domain : null
+    },
+    sslExpirationDate () {
+      return WIKI.config.ssl.enabled && WIKI.config.ssl.provider === `letsencrypt` ? _.get(WIKI.config.letsencrypt, 'payload.expires', null) : null
+    },
+    sslProvider () {
+      return WIKI.config.ssl.enabled ? WIKI.config.ssl.provider : null
+    },
+    sslStatus () {
+      return 'OK'
+    },
+    sslSubscriberEmail () {
+      return WIKI.config.ssl.enabled && WIKI.config.ssl.provider === `letsencrypt` ? WIKI.config.ssl.subscriberEmail : null
+    },
     telemetry () {
       return WIKI.telemetry.enabled
     },
@@ -306,16 +414,20 @@ module.exports = {
       return process.cwd()
     },
     async groupsTotal () {
-      const total = await WIKI.models.groups.query().count('* as total').first().pluck('total')
-      return _.toSafeInteger(total)
+      const total = await WIKI.models.groups.query().count('* as total').first()
+      return _.toSafeInteger(total.total)
     },
     async pagesTotal () {
-      const total = await WIKI.models.pages.query().count('* as total').first().pluck('total')
-      return _.toSafeInteger(total)
+      const total = await WIKI.models.pages.query().count('* as total').first()
+      return _.toSafeInteger(total.total)
     },
     async usersTotal () {
-      const total = await WIKI.models.users.query().count('* as total').first().pluck('total')
-      return _.toSafeInteger(total)
+      const total = await WIKI.models.users.query().count('* as total').first()
+      return _.toSafeInteger(total.total)
+    },
+    async tagsTotal () {
+      const total = await WIKI.models.tags.query().count('* as total').first()
+      return _.toSafeInteger(total.total)
     }
   }
 }

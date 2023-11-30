@@ -8,4 +8,8 @@ block body
       :page-id=page.id
       locale=page.localeCode
       path=page.path
-      )= page.content
+      :version-id=page.versionId
+      version-date=page.versionDate
+      effective-permissions=Buffer.from(JSON.stringify(effectivePermissions)).toString('base64')
+      )
+      code(v-pre)= page.content

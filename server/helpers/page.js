@@ -5,9 +5,12 @@ const path = require('path')
 
 const localeSegmentRegex = /^[A-Z]{2}(-[A-Z]{2})?$/i
 const localeFolderRegex = /^([a-z]{2}(?:-[a-z]{2})?\/)?(.*)/i
+// eslint-disable-next-line no-control-regex
+const unsafeCharsRegex = /[\x00-\x1f\x80-\x9f\\"|<>:*?]/
 
 const contentToExt = {
   markdown: 'md',
+  asciidoc: 'adoc',
   html: 'html'
 }
 const extToContent = _.invert(contentToExt)
@@ -30,10 +33,16 @@ module.exports = {
     // Clean Path
     rawPath = _.trim(qs.unescape(rawPath))
     if (_.startsWith(rawPath, '/')) { rawPath = rawPath.substring(1) }
+    rawPath = rawPath.replace(unsafeCharsRegex, '')
     if (rawPath === '') { rawPath = 'home' }
 
+    rawPath = rawPath.replace(/\\/g, '').replace(/\/\//g, '').replace(/\.\.+/ig, '')
+
     // Extract Info
-    let pathParts = _.filter(_.split(rawPath, '/'), p => !_.isEmpty(p))
+    let pathParts = _.filter(_.split(rawPath, '/'), p => {
+      p = _.trim(p)
+      return !_.isEmpty(p) && p !== '..' && p !== '.'
+    })
     if (pathParts[0].length === 1) {
       pathParts.shift()
     }
@@ -71,13 +80,23 @@ module.exports = {
       ['description', page.description],
       ['published', page.isPublished.toString()],
       ['date', page.updatedAt],
-      ['tags', page.tags ? page.tags.map(t => t.tag).join(', ') : '']
+      ['tags', page.tags ? page.tags.map(t => t.tag).join(', ') : ''],
+      ['editor', page.editorKey],
+      ['dateCreated', page.createdAt]
     ]
-    const inject = {
-      'markdown': '---\n' + meta.map(mt => `${mt[0]}: ${mt[1]}`).join('\n') + '\n---\n\n' + page.content,
-      'html': '<!--\n' + meta.map(mt => `${mt[0]}: ${mt[1]}`).join('\n') + '\n-->\n\n' + page.content
+    switch (page.contentType) {
+      case 'markdown':
+        return '---\n' + meta.map(mt => `${mt[0]}: ${mt[1]}`).join('\n') + '\n---\n\n' + page.content
+      case 'html':
+        return '<!--\n' + meta.map(mt => `${mt[0]}: ${mt[1]}`).join('\n') + '\n-->\n\n' + page.content
+      case 'json':
+        return {
+          ...page.content,
+          _meta: _.fromPairs(meta)
+        }
+      default:
+        return page.content
     }
-    return _.get(inject, page.contentType, page.content)
   },
   /**
    * Check if path is a reserved path
@@ -125,7 +144,7 @@ module.exports = {
     const result = localeFolderRegex.exec(meta.path)
     if (result[1]) {
       meta = {
-        locale: result[1],
+        locale: result[1].replace('/', ''),
         path: result[2]
       }
     }

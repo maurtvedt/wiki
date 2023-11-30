@@ -3,7 +3,7 @@
     v-layout(row, wrap)
       v-flex(xs12)
         .admin-header
-          img(src='/svg/icon-maintenance.svg', alt='Utilities', style='width: 80px;')
+          img(src='/_assets/svg/icon-maintenance.svg', alt='Utilities', style='width: 80px;')
           .admin-header-title
             .headline.primary--text {{$t('admin:utilities.title')}}
             .subtitle-1.grey--text {{$t('admin:utilities.subtitle')}}
@@ -37,6 +37,7 @@ export default {
     UtilityAuth: () => import(/* webpackChunkName: "admin" */ './admin-utilities-auth.vue'),
     UtilityContent: () => import(/* webpackChunkName: "admin" */ './admin-utilities-content.vue'),
     UtilityCache: () => import(/* webpackChunkName: "admin" */ './admin-utilities-cache.vue'),
+    UtilityExport: () => import(/* webpackChunkName: "admin" */ './admin-utilities-export.vue'),
     UtilityImportv1: () => import(/* webpackChunkName: "admin" */ './admin-utilities-importv1.vue'),
     UtilityTelemetry: () => import(/* webpackChunkName: "admin" */ './admin-utilities-telemetry.vue')
   },
@@ -57,17 +58,23 @@ export default {
           isAvailable: true
         },
         {
+          key: 'UtilityExport',
+          icon: 'mdi-database-export',
+          i18nKey: 'export',
+          isAvailable: true
+        },
+        {
           key: 'UtilityCache',
           icon: 'mdi-database-refresh',
           i18nKey: 'cache',
           isAvailable: true
         },
-        {
-          key: 'UtilityGraphEndpoint',
-          icon: 'mdi-graphql',
-          i18nKey: 'graphEndpoint',
-          isAvailable: false
-        },
+        // {
+        //   key: 'UtilityGraphEndpoint',
+        //   icon: 'mdi-graphql',
+        //   i18nKey: 'graphEndpoint',
+        //   isAvailable: false
+        // },
         {
           key: 'UtilityImportv1',
           icon: 'mdi-database-import',

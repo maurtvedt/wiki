@@ -1,11 +1,10 @@
 const path = require('path')
-const uuid = require('uuid/v4')
+const { v4: uuid } = require('uuid')
 const bodyParser = require('body-parser')
 const compression = require('compression')
 const express = require('express')
 const favicon = require('serve-favicon')
 const http = require('http')
-const https = require('https')
 const Promise = require('bluebird')
 const fs = require('fs-extra')
 const _ = require('lodash')
@@ -35,7 +34,7 @@ module.exports = () => {
   // ----------------------------------------
 
   app.use(favicon(path.join(WIKI.ROOTPATH, 'assets', 'favicon.ico')))
-  app.use(express.static(path.join(WIKI.ROOTPATH, 'assets')))
+  app.use('/_assets', express.static(path.join(WIKI.ROOTPATH, 'assets')))
 
   // ----------------------------------------
   // View Engine Setup
@@ -50,6 +49,7 @@ module.exports = () => {
   app.locals.config = WIKI.config
   app.locals.data = WIKI.data
   app.locals._ = require('lodash')
+  app.locals.devMode = WIKI.devMode
 
   // ----------------------------------------
   // HMR (Dev Mode Only)
@@ -103,7 +103,9 @@ module.exports = () => {
         senderEmail: '',
         host: '',
         port: 465,
+        name: '',
         secure: true,
+        verifySSL: true,
         user: '',
         pass: '',
         useDKIM: false,
@@ -134,7 +136,7 @@ module.exports = () => {
 
       // Init Telemetry
       WIKI.kernel.initTelemetry()
-      WIKI.telemetry.sendEvent('setup', 'install-start')
+      // WIKI.telemetry.sendEvent('setup', 'install-start')
 
       // Basic checks
       if (!semver.satisfies(process.version, '>=10.12')) {
@@ -185,8 +187,9 @@ module.exports = () => {
         'sessionSecret',
         'telemetry',
         'theming',
+        'uploads',
         'title'
-      ])
+      ], false)
 
       // Truncate tables (reset from previous failed install)
       await WIKI.models.locales.query().where('code', '!=', 'x').del()
@@ -251,9 +254,18 @@ module.exports = () => {
         throw new Error('Incorrect groups auto-increment configuration! Should start at 0 and increment by 1. Contact your database administrator.')
       }
 
-      // Load authentication strategies + enable local
-      await WIKI.models.authentication.refreshStrategiesFromDisk()
-      await WIKI.models.authentication.query().patch({ isEnabled: true }).where('key', 'local')
+      // Load local authentication strategy
+      await WIKI.models.authentication.query().insert({
+        key: 'local',
+        config: {},
+        selfRegistration: false,
+        isEnabled: true,
+        domainWhitelist: {v: []},
+        autoEnrollGroups: {v: []},
+        order: 0,
+        strategyKey: 'local',
+        displayName: 'Local'
+      })
 
       // Load editors + enable default
       await WIKI.models.editors.refreshEditorsFromDisk()
@@ -269,7 +281,7 @@ module.exports = () => {
       await WIKI.models.searchEngines.refreshSearchEnginesFromDisk()
       await WIKI.models.searchEngines.query().patch({ isEnabled: true }).where('key', 'db')
 
-      WIKI.telemetry.sendEvent('setup', 'install-loadedmodules')
+      // WIKI.telemetry.sendEvent('setup', 'install-loadedmodules')
 
       // Load storage targets
       await WIKI.models.storage.refreshTargetsFromDisk()
@@ -277,7 +289,7 @@ module.exports = () => {
       // Create root administrator
       WIKI.logger.info('Creating root administrator...')
       const adminUser = await WIKI.models.users.query().insert({
-        email: req.body.adminEmail,
+        email: req.body.adminEmail.toLowerCase(),
         provider: 'local',
         password: req.body.adminPassword,
         name: 'Administrator',
@@ -315,23 +327,34 @@ module.exports = () => {
         key: 'site',
         config: [
           {
-            id: uuid(),
-            icon: 'mdi-home',
-            kind: 'link',
-            label: 'Home',
-            target: '/',
-            targetType: 'home'
+            locale: 'en',
+            items: [
+              {
+                id: uuid(),
+                icon: 'mdi-home',
+                kind: 'link',
+                label: 'Home',
+                target: '/',
+                targetType: 'home',
+                visibilityMode: 'all',
+                visibilityGroups: null
+              }
+            ]
           }
         ]
       })
 
       WIKI.logger.info('Setup is complete!')
-      WIKI.telemetry.sendEvent('setup', 'install-completed')
+      // WIKI.telemetry.sendEvent('setup', 'install-completed')
       res.json({
         ok: true,
         redirectPath: '/',
         redirectPort: WIKI.config.port
       }).end()
+
+      if (WIKI.config.telemetry.isEnabled) {
+        await WIKI.telemetry.sendInstanceEvent('INSTALL')
+      }
 
       WIKI.config.setup = false
 
@@ -356,7 +379,7 @@ module.exports = () => {
   // ----------------------------------------
 
   app.use(function (req, res, next) {
-    var err = new Error('Not Found')
+    const err = new Error('Not Found')
     err.status = 404
     next(err)
   })
@@ -379,32 +402,8 @@ module.exports = () => {
 
   app.set('port', WIKI.config.port)
 
-  if (WIKI.config.ssl.enabled) {
-    WIKI.logger.info(`HTTPS Server on port: [ ${WIKI.config.port} ]`)
-    const tlsOpts = {}
-    try {
-      if (WIKI.config.ssl.format === 'pem') {
-        tlsOpts.key = fs.readFileSync(WIKI.config.ssl.key)
-        tlsOpts.cert = fs.readFileSync(WIKI.config.ssl.cert)
-      } else {
-        tlsOpts.pfx = fs.readFileSync(WIKI.config.ssl.pfx)
-      }
-      if (!_.isEmpty(WIKI.config.ssl.passphrase)) {
-        tlsOpts.passphrase = WIKI.config.ssl.passphrase
-      }
-      if (!_.isEmpty(WIKI.config.ssl.dhparam)) {
-        tlsOpts.dhparam = WIKI.config.ssl.dhparam
-      }
-    } catch (err) {
-      WIKI.logger.error('Failed to setup HTTPS server parameters:')
-      WIKI.logger.error(err)
-      return process.exit(1)
-    }
-    WIKI.server = https.createServer(tlsOpts, app)
-  } else {
-    WIKI.logger.info(`HTTP Server on port: [ ${WIKI.config.port} ]`)
-    WIKI.server = http.createServer(app)
-  }
+  WIKI.logger.info(`HTTP Server on port: [ ${WIKI.config.port} ]`)
+  WIKI.server = http.createServer(app)
   WIKI.server.listen(WIKI.config.port, WIKI.config.bindIP)
 
   var openConnections = []
@@ -445,7 +444,7 @@ module.exports = () => {
     WIKI.logger.info('HTTP Server: [ RUNNING ]')
     WIKI.logger.info('🔻🔻🔻🔻🔻🔻🔻🔻🔻🔻🔻🔻🔻🔻🔻🔻🔻🔻🔻🔻🔻🔻🔻🔻🔻🔻🔻🔻🔻')
     WIKI.logger.info('')
-    WIKI.logger.info(`Browse to http://localhost:${WIKI.config.port}/ to complete setup!`)
+    WIKI.logger.info(`Browse to http://YOUR-SERVER-IP:${WIKI.config.port}/ to complete setup!`)
     WIKI.logger.info('')
     WIKI.logger.info('🔺🔺🔺🔺🔺🔺🔺🔺🔺🔺🔺🔺🔺🔺🔺🔺🔺🔺🔺🔺🔺🔺🔺🔺🔺🔺🔺🔺🔺')
   })

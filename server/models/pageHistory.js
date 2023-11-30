@@ -1,5 +1,6 @@
 const Model = require('objection').Model
 const _ = require('lodash')
+const { DateTime, Duration } = require('luxon')
 
 /* global WIKI */
 
@@ -84,6 +85,9 @@ module.exports = class PageHistory extends Model {
     this.createdAt = new Date().toISOString()
   }
 
+  /**
+   * Create Page Version
+   */
   static async addVersion(opts) {
     await WIKI.models.pageHistory.query().insert({
       pageId: opts.id,
@@ -100,10 +104,57 @@ module.exports = class PageHistory extends Model {
       publishEndDate: opts.publishEndDate || '',
       publishStartDate: opts.publishStartDate || '',
       title: opts.title,
-      action: opts.action || 'updated'
+      action: opts.action || 'updated',
+      versionDate: opts.versionDate
     })
   }
 
+  /**
+   * Get Page Version
+   */
+  static async getVersion({ pageId, versionId }) {
+    const version = await WIKI.models.pageHistory.query()
+      .column([
+        'pageHistory.path',
+        'pageHistory.title',
+        'pageHistory.description',
+        'pageHistory.isPrivate',
+        'pageHistory.isPublished',
+        'pageHistory.publishStartDate',
+        'pageHistory.publishEndDate',
+        'pageHistory.content',
+        'pageHistory.contentType',
+        'pageHistory.createdAt',
+        'pageHistory.action',
+        'pageHistory.authorId',
+        'pageHistory.pageId',
+        'pageHistory.versionDate',
+        {
+          versionId: 'pageHistory.id',
+          editor: 'pageHistory.editorKey',
+          locale: 'pageHistory.localeCode',
+          authorName: 'author.name'
+        }
+      ])
+      .joinRelated('author')
+      .where({
+        'pageHistory.id': versionId,
+        'pageHistory.pageId': pageId
+      }).first()
+    if (version) {
+      return {
+        ...version,
+        updatedAt: version.createdAt || null,
+        tags: []
+      }
+    } else {
+      return null
+    }
+  }
+
+  /**
+   * Get History Trail of a Page
+   */
   static async getHistory({ pageId, offsetPage = 0, offsetSize = 100 }) {
     const history = await WIKI.models.pageHistory.query()
       .column([
@@ -111,16 +162,16 @@ module.exports = class PageHistory extends Model {
         'pageHistory.path',
         'pageHistory.authorId',
         'pageHistory.action',
-        'pageHistory.createdAt',
+        'pageHistory.versionDate',
         {
           authorName: 'author.name'
         }
       ])
-      .joinRelation('author')
+      .joinRelated('author')
       .where({
         'pageHistory.pageId': pageId
       })
-      .orderBy('pageHistory.createdAt', 'desc')
+      .orderBy('pageHistory.versionDate', 'desc')
       .page(offsetPage, offsetSize)
 
     let prevPh = null
@@ -133,16 +184,16 @@ module.exports = class PageHistory extends Model {
           'pageHistory.path',
           'pageHistory.authorId',
           'pageHistory.action',
-          'pageHistory.createdAt',
+          'pageHistory.versionDate',
           {
             authorName: 'author.name'
           }
         ])
-        .joinRelation('author')
+        .joinRelated('author')
         .where({
           'pageHistory.pageId': pageId
         })
-        .orderBy('pageHistory.createdAt', 'desc')
+        .orderBy('pageHistory.versionDate', 'desc')
         .offset((offsetPage + 1) * offsetSize)
         .limit(1)
         .first()
@@ -169,7 +220,7 @@ module.exports = class PageHistory extends Model {
           actionType,
           valueBefore,
           valueAfter,
-          createdAt: ph.createdAt
+          versionDate: ph.versionDate
         })
 
         prevPh = ph
@@ -177,5 +228,16 @@ module.exports = class PageHistory extends Model {
       }, []),
       total: history.total
     }
+  }
+
+  /**
+   * Purge history older than X
+   *
+   * @param {String} olderThan ISO 8601 Duration
+   */
+  static async purge (olderThan) {
+    const dur = Duration.fromISO(olderThan)
+    const olderThanISO = DateTime.utc().minus(dur)
+    await WIKI.models.pageHistory.query().where('versionDate', '<', olderThanISO.toISO()).del()
   }
 }

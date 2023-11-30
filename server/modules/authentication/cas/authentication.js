@@ -1,3 +1,4 @@
+const _ = require('lodash')
 /* global WIKI */
 
 // ------------------------------------
@@ -8,17 +9,31 @@ const CASStrategy = require('passport-cas').Strategy
 
 module.exports = {
   init (passport, conf) {
-    passport.use('cas',
+    passport.use(conf.key,
       new CASStrategy({
-        ssoBaseURL: conf.ssoBaseURL,
-        serverBaseURL: conf.serverBaseURL
-      }, (profile, cb) => {
-        WIKI.models.users.processProfile(profile).then((user) => {
-          return cb(null, user) || true
-        }).catch((err) => {
-          return cb(err, null) || true
-        })
-      }
-      ))
+        version: conf.casVersion,
+        ssoBaseURL: conf.casUrl,
+        serverBaseURL: conf.baseUrl,
+        serviceURL: conf.callbackURL,
+        passReqToCallback: true
+      }, async (req, profile, cb) => {
+        try {
+          const user = await WIKI.models.users.processProfile({
+            providerKey: req.params.strategy,
+            profile: {
+              ...profile,
+              id: _.get(profile.attributes, conf.uniqueIdAttribute, profile.user),
+              email: _.get(profile.attributes, conf.emailAttribute),
+              name: _.get(profile.attributes, conf.displayNameAttribute, profile.user),
+              picture: ''
+            }
+          })
+
+          cb(null, user)
+        } catch (err) {
+          cb(err, null)
+        }
+      })
+    )
   }
 }

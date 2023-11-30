@@ -9,21 +9,22 @@ const _ = require('lodash')
 
 module.exports = {
   init (passport, conf) {
-    passport.use('facebook',
+    passport.use(conf.key,
       new FacebookStrategy({
         clientID: conf.clientId,
         clientSecret: conf.clientSecret,
         callbackURL: conf.callbackURL,
         profileFields: ['id', 'displayName', 'email', 'photos'],
-        authType: 'reauthenticate'
-      }, async (accessToken, refreshToken, profile, cb) => {
+        authType: 'reauthenticate',
+        passReqToCallback: true
+      }, async (req, accessToken, refreshToken, profile, cb) => {
         try {
           const user = await WIKI.models.users.processProfile({
+            providerKey: req.params.strategy,
             profile: {
               ...profile,
               picture: _.get(profile, 'photos[0].value', '')
-            },
-            providerKey: 'facebook'
+            }
           })
           cb(null, user)
         } catch (err) {

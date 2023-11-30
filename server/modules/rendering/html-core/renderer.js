@@ -4,19 +4,27 @@ const uslug = require('uslug')
 const pageHelper = require('../../../helpers/page')
 const URL = require('url').URL
 
+const mustacheRegExp = /(\{|&#x7b;?){2}(.+?)(\}|&#x7d;?){2}/i
+
 /* global WIKI */
 
 module.exports = {
   async render() {
-    const $ = cheerio.load(this.input)
+    const $ = cheerio.load(this.input, {
+      decodeEntities: true
+    })
 
     if ($.root().children().length < 1) {
       return ''
     }
 
-    for (let child of this.children) {
+    // --------------------------------
+    // STEP: PRE
+    // --------------------------------
+
+    for (let child of _.reject(this.children, ['step', 'post'])) {
       const renderer = require(`../${_.kebabCase(child.key)}/renderer.js`)
-      renderer.init($, child.config)
+      await renderer.init($, child.config)
     }
 
     // --------------------------------
@@ -24,8 +32,8 @@ module.exports = {
     // --------------------------------
 
     let internalRefs = []
-    const reservedPrefixes = /^\/[a-z]\//gi
-    const exactReservedPaths = /^\/[a-z]$/gi
+    const reservedPrefixes = /^\/[a-z]\//i
+    const exactReservedPaths = /^\/[a-z]$/i
 
     const isHostSet = WIKI.config.host.length > 7 && WIKI.config.host !== 'http://'
     if (!isHostSet) {
@@ -35,13 +43,14 @@ module.exports = {
     $('a').each((i, elm) => {
       let href = $(elm).attr('href')
 
-      // -> Ignore empty / anchor links
-      if (!href || href.length < 1 || href.indexOf('#') === 0 || href.indexOf('mailto:') === 0) {
+      // -> Ignore empty / anchor links, e-mail addresses, and telephone numbers
+      if (!href || href.length < 1 || href.indexOf('#') === 0 ||
+        href.indexOf('mailto:') === 0 || href.indexOf('tel:') === 0) {
         return
       }
 
       // -> Strip host from local links
-      if (isHostSet && href.indexOf(WIKI.config.host) === 0) {
+      if (isHostSet && href.indexOf(`${WIKI.config.host}/`) === 0) {
         href = href.replace(WIKI.config.host, '')
       }
 
@@ -64,7 +73,11 @@ module.exports = {
           if (WIKI.config.lang.namespacing) {
             // -> Reformat paths
             if (href.indexOf('/') !== 0) {
-              href = (this.page.path === 'home') ? `/${this.page.localeCode}/${href}` : `/${this.page.localeCode}/${this.page.path}/${href}`
+              if (this.config.absoluteLinks) {
+                href = `/${this.page.localeCode}/${href}`
+              } else {
+                href = (this.page.path === 'home') ? `/${this.page.localeCode}/${href}` : `/${this.page.localeCode}/${this.page.path}/${href}`
+              }
             } else if (href.charAt(3) !== '/') {
               href = `/${this.page.localeCode}${href}`
             }
@@ -78,7 +91,11 @@ module.exports = {
           } else {
             // -> Reformat paths
             if (href.indexOf('/') !== 0) {
-              href = (this.page.path === 'home') ? `/${href}` : `/${this.page.path}/${href}`
+              if (this.config.absoluteLinks) {
+                href = `/${href}`
+              } else {
+                href = (this.page.path === 'home') ? `/${href}` : `/${this.page.path}/${href}`
+              }
             }
 
             try {
@@ -98,6 +115,10 @@ module.exports = {
         }
       } else {
         $(elm).addClass(`is-external-link`)
+        if (this.config.openExternalLinkNewTab) {
+          $(elm).attr('target', '_blank')
+          $(elm).attr('rel', this.config.relAttributeExternalLink)
+        }
       }
 
       // -> Update element
@@ -180,10 +201,11 @@ module.exports = {
 
     let headers = []
     $('h1,h2,h3,h4,h5,h6').each((i, elm) => {
-      if ($(elm).attr('id')) {
-        return
-      }
       let headerSlug = uslug($(elm).text())
+      // -> If custom ID is defined, try to use that instead
+      if ($(elm).attr('id')) {
+        headerSlug = $(elm).attr('id')
+      }
 
       // -> Cannot start with a number (CSS selector limitation)
       if (headerSlug.match(/^\d/)) {
@@ -211,6 +233,71 @@ module.exports = {
       headers.push(headerSlug)
     })
 
-    return $.html('body').replace('<body>', '').replace('</body>', '')
+    // --------------------------------
+    // Wrap non-empty root text nodes
+    // --------------------------------
+
+    $('body').contents().toArray().forEach(item => {
+      if (item && item.type === 'text' && item.parent.name === 'body' && item.data !== `\n` && item.data !== `\r`) {
+        $(item).wrap('<div></div>')
+      }
+    })
+
+    // --------------------------------
+    // Wrap root table nodes
+    // --------------------------------
+
+    $('body').contents().toArray().forEach(item => {
+      if (item && item.name === 'table' && item.parent.name === 'body') {
+        $(item).wrap('<div class="table-container"></div>')
+      }
+    })
+
+    // --------------------------------
+    // Escape mustache expresions
+    // --------------------------------
+
+    function iterateMustacheNode (node) {
+      const list = $(node).contents().toArray()
+      list.forEach(item => {
+        if (item && item.type === 'text') {
+          const rawText = $(item).text().replace(/\r?\n|\r/g, '')
+          if (mustacheRegExp.test(rawText)) {
+            $(item).parent().attr('v-pre', true)
+          }
+        } else {
+          iterateMustacheNode(item)
+        }
+      })
+    }
+    iterateMustacheNode($.root())
+
+    $('pre').each((idx, elm) => {
+      $(elm).attr('v-pre', true)
+    })
+
+    // --------------------------------
+    // STEP: POST
+    // --------------------------------
+
+    let output = decodeEscape($.html('body').replace('<body>', '').replace('</body>', ''))
+
+    for (let child of _.sortBy(_.filter(this.children, ['step', 'post']), ['order'])) {
+      const renderer = require(`../${_.kebabCase(child.key)}/renderer.js`)
+      output = await renderer.init(output, child.config)
+    }
+
+    return output
   }
+}
+
+function decodeEscape (string) {
+  return string.replace(/&#x([0-9a-f]{1,6});/ig, (entity, code) => {
+    code = parseInt(code, 16)
+
+    // Don't unescape ASCII characters, assuming they're encoded for a good reason
+    if (code < 0x80) return entity
+
+    return String.fromCodePoint(code)
+  })
 }

@@ -13,7 +13,11 @@ module.exports = {
       let conf = {
         host: WIKI.config.mail.host,
         port: WIKI.config.mail.port,
-        secure: WIKI.config.mail.secure
+        name: WIKI.config.mail.name,
+        secure: WIKI.config.mail.secure,
+        tls: {
+          rejectUnauthorized: !(WIKI.config.mail.verifySSL === false)
+        }
       }
       if (_.get(WIKI.config, 'mail.user', '').length > 1) {
         conf = {
@@ -48,12 +52,15 @@ module.exports = {
     }
     await this.loadTemplate(opts.template)
     return this.transport.sendMail({
+      headers: {
+        'x-mailer': 'Wiki.js'
+      },
       from: `"${WIKI.config.mail.senderName}" <${WIKI.config.mail.senderEmail}>`,
       to: opts.to,
       subject: `${opts.subject} - ${WIKI.config.title}`,
       text: opts.text,
       html: _.get(this.templates, opts.template)({
-        logo: '',
+        logo: (WIKI.config.logoUrl.startsWith('http') ? '' : WIKI.config.host) + WIKI.config.logoUrl,
         siteTitle: WIKI.config.title,
         copyright: WIKI.config.company.length > 0 ? WIKI.config.company : 'Powered by Wiki.js',
         ...opts.data

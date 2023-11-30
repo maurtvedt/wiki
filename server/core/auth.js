@@ -2,7 +2,8 @@ const passport = require('passport')
 const passportJWT = require('passport-jwt')
 const _ = require('lodash')
 const jwt = require('jsonwebtoken')
-const moment = require('moment')
+const ms = require('ms')
+const { DateTime } = require('luxon')
 const Promise = require('bluebird')
 const crypto = Promise.promisifyAll(require('crypto'))
 const pem2jwk = require('pem-jwk').pem2jwk
@@ -14,9 +15,11 @@ const securityHelper = require('../helpers/security')
 module.exports = {
   strategies: {},
   guest: {
-    cacheExpiration: moment.utc().subtract(1, 'd')
+    cacheExpiration: DateTime.utc().minus({ days: 1 })
   },
   groups: {},
+  validApiKeys: [],
+  revocationList: require('./cache').init(),
 
   /**
    * Initialize the authentication module
@@ -30,7 +33,7 @@ module.exports = {
 
     passport.deserializeUser(async (id, done) => {
       try {
-        const user = await WIKI.models.users.query().findById(id).modifyEager('groups', builder => {
+        const user = await WIKI.models.users.query().findById(id).withGraphFetched('groups').modifyGraph('groups', builder => {
           builder.select('groups.id', 'permissions')
         })
         if (user) {
@@ -44,6 +47,7 @@ module.exports = {
     })
 
     this.reloadGroups()
+    this.reloadApiKeys()
 
     return this
   },
@@ -51,7 +55,7 @@ module.exports = {
   /**
    * Load authentication strategies
    */
-  async activateStrategies() {
+  async activateStrategies () {
     try {
       // Unload any active strategies
       WIKI.auth.strategies = {}
@@ -64,7 +68,8 @@ module.exports = {
         jwtFromRequest: securityHelper.extractJWT,
         secretOrKey: WIKI.config.certs.public,
         audience: WIKI.config.auth.audience,
-        issuer: 'urn:wiki.js'
+        issuer: 'urn:wiki.js',
+        algorithms: ['RS256']
       }, (jwtPayload, cb) => {
         cb(null, jwtPayload)
       }))
@@ -73,22 +78,26 @@ module.exports = {
       const enabledStrategies = await WIKI.models.authentication.getStrategies()
       for (let idx in enabledStrategies) {
         const stg = enabledStrategies[idx]
-        if (!stg.isEnabled) { continue }
+        try {
+          const strategy = require(`../modules/authentication/${stg.strategyKey}/authentication.js`)
 
-        const strategy = require(`../modules/authentication/${stg.key}/authentication.js`)
+          stg.config.callbackURL = `${WIKI.config.host}/login/${stg.key}/callback`
+          stg.config.key = stg.key;
+          strategy.init(passport, stg.config)
+          strategy.config = stg.config
 
-        stg.config.callbackURL = `${WIKI.config.host}/login/${stg.key}/callback`
-        strategy.init(passport, stg.config)
-        strategy.config = stg.config
-
-        WIKI.auth.strategies[stg.key] = {
-          ...strategy,
-          ...stg
+          WIKI.auth.strategies[stg.key] = {
+            ...strategy,
+            ...stg
+          }
+          WIKI.logger.info(`Authentication Strategy ${stg.displayName}: [ OK ]`)
+        } catch (err) {
+          WIKI.logger.error(`Authentication Strategy ${stg.displayName} (${stg.key}): [ FAILED ]`)
+          WIKI.logger.error(err)
         }
-        WIKI.logger.info(`Authentication Strategy ${stg.key}: [ OK ]`)
       }
     } catch (err) {
-      WIKI.logger.error(`Authentication Strategy: [ FAILED ]`)
+      WIKI.logger.error(`Failed to initialize Authentication Strategies: [ ERROR ]`)
       WIKI.logger.error(err)
     }
   },
@@ -100,24 +109,52 @@ module.exports = {
    * @param {Express Response} res
    * @param {Express Next Callback} next
    */
-  authenticate(req, res, next) {
+  authenticate (req, res, next) {
     WIKI.auth.passport.authenticate('jwt', {session: false}, async (err, user, info) => {
       if (err) { return next() }
+      let mustRevalidate = false
 
       // Expired but still valid within N days, just renew
-      if (info instanceof Error && info.name === 'TokenExpiredError' && moment().subtract(14, 'days').isBefore(info.expiredAt)) {
+      if (info instanceof Error && info.name === 'TokenExpiredError') {
+        const expiredDate = (info.expiredAt instanceof Date) ? info.expiredAt.toISOString() : info.expiredAt
+        if (DateTime.utc().minus(ms(WIKI.config.auth.tokenRenewal)) < DateTime.fromISO(expiredDate)) {
+          mustRevalidate = true
+        }
+      }
+
+      // Check if user / group is in revocation list
+      if (user && !user.api && !mustRevalidate) {
+        const uRevalidate = WIKI.auth.revocationList.get(`u${_.toString(user.id)}`)
+        if (uRevalidate && user.iat < uRevalidate) {
+          mustRevalidate = true
+        } else if (DateTime.fromSeconds(user.iat) <= WIKI.startedAt) { // Prevent new / restarted instance from allowing revoked tokens
+          mustRevalidate = true
+        } else {
+          for (const gid of user.groups) {
+            const gRevalidate = WIKI.auth.revocationList.get(`g${_.toString(gid)}`)
+            if (gRevalidate && user.iat < gRevalidate) {
+              mustRevalidate = true
+              break
+            }
+          }
+        }
+      }
+
+      // Revalidate and renew token
+      if (mustRevalidate) {
         const jwtPayload = jwt.decode(securityHelper.extractJWT(req))
         try {
           const newToken = await WIKI.models.users.refreshToken(jwtPayload.id)
           user = newToken.user
           user.permissions = user.getGlobalPermissions()
+          user.groups = user.getGroups()
           req.user = user
 
           // Try headers, otherwise cookies for response
           if (req.get('content-type') === 'application/json') {
             res.set('new-jwt', newToken.token)
           } else {
-            res.cookie('jwt', newToken.token, { expires: moment().add(365, 'days').toDate() })
+            res.cookie('jwt', newToken.token, { expires: DateTime.utc().plus({ days: 365 }).toJSDate() })
           }
         } catch (errc) {
           WIKI.logger.warn(errc)
@@ -127,12 +164,39 @@ module.exports = {
 
       // JWT is NOT valid, set as guest
       if (!user) {
-        if (WIKI.auth.guest.cacheExpiration.isSameOrBefore(moment.utc())) {
+        if (WIKI.auth.guest.cacheExpiration <= DateTime.utc()) {
           WIKI.auth.guest = await WIKI.models.users.getGuestUser()
-          WIKI.auth.guest.cacheExpiration = moment.utc().add(1, 'm')
+          WIKI.auth.guest.cacheExpiration = DateTime.utc().plus({ minutes: 1 })
         }
         req.user = WIKI.auth.guest
         return next()
+      }
+
+      // Process API tokens
+      if (_.has(user, 'api')) {
+        if (!WIKI.config.api.isEnabled) {
+          return next(new Error('API is disabled. You must enable it from the Administration Area first.'))
+        } else if (_.includes(WIKI.auth.validApiKeys, user.api)) {
+          req.user = {
+            id: 1,
+            email: 'api@localhost',
+            name: 'API',
+            pictureUrl: null,
+            timezone: 'America/New_York',
+            localeCode: 'en',
+            permissions: _.get(WIKI.auth.groups, `${user.grp}.permissions`, []),
+            groups: [user.grp],
+            getGlobalPermissions () {
+              return req.user.permissions
+            },
+            getGroups () {
+              return req.user.groups
+            }
+          }
+          return next()
+        } else {
+          return next(new Error('API Key is invalid or was revoked.'))
+        }
       }
 
       // JWT is valid
@@ -163,8 +227,13 @@ module.exports = {
       return false
     }
 
+    // Skip if no page rule to check
+    if (!page) {
+      return true
+    }
+
     // Check Page Rules
-    if (page && user.groups) {
+    if (user.groups) {
       let checkState = {
         deny: false,
         match: false,
@@ -173,28 +242,44 @@ module.exports = {
       user.groups.forEach(grp => {
         const grpId = _.isObject(grp) ? _.get(grp, 'id', 0) : grp
         _.get(WIKI.auth.groups, `${grpId}.pageRules`, []).forEach(rule => {
-          switch (rule.match) {
-            case 'START':
-              if (_.startsWith(`/${page.path}`, `/${rule.path}`)) {
-                checkState = this._applyPageRuleSpecificity({ rule, checkState, higherPriority: ['END', 'REGEX', 'EXACT'] })
-              }
-              break
-            case 'END':
-              if (_.endsWith(page.path, rule.path)) {
-                checkState = this._applyPageRuleSpecificity({ rule, checkState, higherPriority: ['REGEX', 'EXACT'] })
-              }
-              break
-            case 'REGEX':
-              const reg = new RegExp(rule.path)
-              if (reg.test(page.path)) {
-                checkState = this._applyPageRuleSpecificity({ rule, checkState, higherPriority: ['EXACT'] })
-              }
-              break
-            case 'EXACT':
-              if (`/${page.path}` === `/${rule.path}`) {
-                checkState = this._applyPageRuleSpecificity({ rule, checkState, higherPriority: [] })
-              }
-              break
+          if (rule.locales && rule.locales.length > 0) {
+            if (!rule.locales.includes(page.locale)) { return }
+          }
+          if (_.intersection(rule.roles, permissions).length > 0) {
+            switch (rule.match) {
+              case 'START':
+                if (_.startsWith(`/${page.path}`, `/${rule.path}`)) {
+                  checkState = this._applyPageRuleSpecificity({ rule, checkState, higherPriority: ['END', 'REGEX', 'EXACT', 'TAG'] })
+                }
+                break
+              case 'END':
+                if (_.endsWith(page.path, rule.path)) {
+                  checkState = this._applyPageRuleSpecificity({ rule, checkState, higherPriority: ['REGEX', 'EXACT', 'TAG'] })
+                }
+                break
+              case 'REGEX':
+                const reg = new RegExp(rule.path)
+                if (reg.test(page.path)) {
+                  checkState = this._applyPageRuleSpecificity({ rule, checkState, higherPriority: ['EXACT', 'TAG'] })
+                }
+                break
+              case 'TAG':
+                _.get(page, 'tags', []).forEach(tag => {
+                  if (tag.tag === rule.path) {
+                    checkState = this._applyPageRuleSpecificity({
+                      rule,
+                      checkState,
+                      higherPriority: ['EXACT']
+                    })
+                  }
+                })
+                break
+              case 'EXACT':
+                if (`/${page.path}` === `/${rule.path}`) {
+                  checkState = this._applyPageRuleSpecificity({ rule, checkState, higherPriority: [] })
+                }
+                break
+            }
           }
         })
       })
@@ -203,6 +288,29 @@ module.exports = {
     }
 
     return false
+  },
+
+  /**
+   * Check for exclusive permissions (contain any X permission(s) but not any Y permission(s))
+   *
+   * @param {User} user
+   * @param {Array<String>} includePermissions
+   * @param {Array<String>} excludePermissions
+   */
+  checkExclusiveAccess(user, includePermissions = [], excludePermissions = []) {
+    const userPermissions = user.permissions ? user.permissions : user.getGlobalPermissions()
+
+    // Check Inclusion Permissions
+    if (_.intersection(userPermissions, includePermissions).length < 1) {
+      return false
+    }
+
+    // Check Exclusion Permissions
+    if (_.intersection(userPermissions, excludePermissions).length > 0) {
+      return false
+    }
+
+    return true
   },
 
   /**
@@ -235,15 +343,24 @@ module.exports = {
   /**
    * Reload Groups from DB
    */
-  async reloadGroups() {
+  async reloadGroups () {
     const groupsArray = await WIKI.models.groups.query()
     this.groups = _.keyBy(groupsArray, 'id')
+    WIKI.auth.guest.cacheExpiration = DateTime.utc().minus({ days: 1 })
+  },
+
+  /**
+   * Reload valid API Keys from DB
+   */
+  async reloadApiKeys () {
+    const keys = await WIKI.models.apiKeys.query().select('id').where('isRevoked', false).andWhere('expiration', '>', DateTime.utc().toISO())
+    this.validApiKeys = _.map(keys, 'id')
   },
 
   /**
    * Generate New Authentication Public / Private Key Certificates
    */
-  async regenerateCertificates() {
+  async regenerateCertificates () {
     WIKI.logger.info('Regenerating certificates...')
 
     _.set(WIKI.config, 'sessionSecret', (await crypto.randomBytesAsync(32)).toString('hex'))
@@ -273,6 +390,7 @@ module.exports = {
     ])
 
     await WIKI.auth.activateStrategies()
+    WIKI.events.outbound.emit('reloadAuthStrategies')
 
     WIKI.logger.info('Regenerated certificates: [ COMPLETED ]')
   },
@@ -305,5 +423,60 @@ module.exports = {
     await guestUser.$relatedQuery('groups').relate(guestGroup.id)
 
     WIKI.logger.info('Guest user has been reset: [ COMPLETED ]')
+  },
+
+  /**
+   * Subscribe to HA propagation events
+   */
+  subscribeToEvents() {
+    WIKI.events.inbound.on('reloadGroups', () => {
+      WIKI.auth.reloadGroups()
+    })
+    WIKI.events.inbound.on('reloadApiKeys', () => {
+      WIKI.auth.reloadApiKeys()
+    })
+    WIKI.events.inbound.on('reloadAuthStrategies', () => {
+      WIKI.auth.activateStrategies()
+    })
+    WIKI.events.inbound.on('addAuthRevoke', (args) => {
+      WIKI.auth.revokeUserTokens(args)
+    })
+  },
+
+  /**
+   * Get all user permissions for a specific page
+   */
+  getEffectivePermissions (req, page) {
+    return {
+      comments: {
+        read: WIKI.config.features.featurePageComments ? WIKI.auth.checkAccess(req.user, ['read:comments'], page) : false,
+        write: WIKI.config.features.featurePageComments ? WIKI.auth.checkAccess(req.user, ['write:comments'], page) : false,
+        manage: WIKI.config.features.featurePageComments ? WIKI.auth.checkAccess(req.user, ['manage:comments'], page) : false
+      },
+      history: {
+        read: WIKI.auth.checkAccess(req.user, ['read:history'], page)
+      },
+      source: {
+        read: WIKI.auth.checkAccess(req.user, ['read:source'], page)
+      },
+      pages: {
+        read: WIKI.auth.checkAccess(req.user, ['read:pages'], page),
+        write: WIKI.auth.checkAccess(req.user, ['write:pages'], page),
+        manage: WIKI.auth.checkAccess(req.user, ['manage:pages'], page),
+        delete: WIKI.auth.checkAccess(req.user, ['delete:pages'], page),
+        script: WIKI.auth.checkAccess(req.user, ['write:scripts'], page),
+        style: WIKI.auth.checkAccess(req.user, ['write:styles'], page)
+      },
+      system: {
+        manage: WIKI.auth.checkAccess(req.user, ['manage:system'], page)
+      }
+    }
+  },
+
+  /**
+   * Add user / group ID to JWT revocation list, forcing all requests to be validated against the latest permissions
+   */
+  revokeUserTokens ({ id, kind = 'u' }) {
+    WIKI.auth.revocationList.set(`${kind}${_.toString(id)}`, Math.round(DateTime.utc().minus({ seconds: 5 }).toSeconds()), Math.ceil(ms(WIKI.config.auth.tokenExpiration) / 1000))
   }
 }

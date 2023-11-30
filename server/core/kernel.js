@@ -1,5 +1,5 @@
 const _ = require('lodash')
-const EventEmitter = require('events')
+const EventEmitter = require('eventemitter2').EventEmitter2
 
 /* global WIKI */
 
@@ -19,7 +19,7 @@ module.exports = {
     } catch (err) {
       WIKI.logger.error('Database Initialization Error: ' + err.message)
       if (WIKI.IS_DEBUG) {
-        console.error(err)
+        WIKI.logger.error(err)
       }
       process.exit(1)
     }
@@ -32,10 +32,16 @@ module.exports = {
   async preBootMaster() {
     try {
       await this.initTelemetry()
+      WIKI.sideloader = await require('./sideloader').init()
       WIKI.cache = require('./cache').init()
       WIKI.scheduler = require('./scheduler').init()
-      WIKI.sideloader = require('./sideloader').init()
-      WIKI.events = new EventEmitter()
+      WIKI.servers = require('./servers')
+      WIKI.events = {
+        inbound: new EventEmitter(),
+        outbound: new EventEmitter()
+      }
+      WIKI.extensions = require('./extensions')
+      WIKI.asar = require('./asar')
     } catch (err) {
       WIKI.logger.error(err)
       process.exit(1)
@@ -65,16 +71,22 @@ module.exports = {
   async postBootMaster() {
     await WIKI.models.analytics.refreshProvidersFromDisk()
     await WIKI.models.authentication.refreshStrategiesFromDisk()
+    await WIKI.models.commentProviders.refreshProvidersFromDisk()
     await WIKI.models.editors.refreshEditorsFromDisk()
     await WIKI.models.loggers.refreshLoggersFromDisk()
     await WIKI.models.renderers.refreshRenderersFromDisk()
     await WIKI.models.searchEngines.refreshSearchEnginesFromDisk()
     await WIKI.models.storage.refreshTargetsFromDisk()
 
+    await WIKI.extensions.init()
+
     await WIKI.auth.activateStrategies()
+    await WIKI.models.commentProviders.initProvider()
     await WIKI.models.searchEngines.initEngine()
     await WIKI.models.storage.initTargets()
     WIKI.scheduler.start()
+
+    await WIKI.models.subscribeToNotifications()
   },
   /**
    * Init Telemetry
@@ -90,5 +102,28 @@ module.exports = {
       WIKI.logger.warn(err)
       WIKI.telemetry.sendError(err)
     })
+  },
+  /**
+   * Graceful shutdown
+   */
+  async shutdown (devMode = false) {
+    if (WIKI.servers) {
+      await WIKI.servers.stopServers()
+    }
+    if (WIKI.scheduler) {
+      await WIKI.scheduler.stop()
+    }
+    if (WIKI.models) {
+      await WIKI.models.unsubscribeToNotifications()
+      if (WIKI.models.knex) {
+        await WIKI.models.knex.destroy()
+      }
+    }
+    if (WIKI.asar) {
+      await WIKI.asar.unload()
+    }
+    if (!devMode) {
+      process.exit(0)
+    }
   }
 }

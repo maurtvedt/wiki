@@ -57,6 +57,8 @@
                 :items-per-page='15'
                 :loading='loading'
                 must-sort,
+                sort-by='ID',
+                sort-desc,
                 hide-default-footer,
                 dense
               )
@@ -78,7 +80,7 @@
                     td(v-if='$vuetify.breakpoint.smAndUp')
                       v-menu(offset-x, min-width='200')
                         template(v-slot:activator='{ on }')
-                          v-btn(icon, v-on='on', tile, small)
+                          v-btn(icon, v-on='on', tile, small, @click.left='currentFileId = props.item.id')
                             v-icon(color='grey darken-2') mdi-dots-horizontal
                         v-list(nav, style='border-top: 5px solid #444;')
                           v-list-item(@click='', disabled)
@@ -141,7 +143,7 @@
                 allow-multiple='true'
                 :files='files'
                 max-files='10'
-                server='/u'
+                :server='filePondServerOpts'
                 :instant-upload='false'
                 :allow-revert='false'
                 @processfile='onFileProcessed'
@@ -228,6 +230,7 @@
 <script>
 import _ from 'lodash'
 import { get, sync } from 'vuex-pathify'
+import Cookies from 'js-cookie'
 import vueFilePond from 'vue-filepond'
 import 'filepond/dist/filepond.min.css'
 
@@ -310,6 +313,17 @@ export default {
     },
     currentAsset () {
       return _.find(this.assets, ['id', this.currentFileId]) || {}
+    },
+    filePondServerOpts () {
+      const jwtToken = Cookies.get('jwt')
+      return {
+        process: {
+          url: '/u',
+          headers: {
+            'Authorization': `Bearer ${jwtToken}`
+          }
+        }
+      }
     }
   },
   watch: {
@@ -575,6 +589,20 @@ export default {
     @include until($tablet) {
       top: 56px;
       height: calc(100vh - 56px - 24px);
+    }
+  }
+
+  &.is-editor-common {
+    top: 64px;
+    left: 0;
+    width: 100%;
+    height: calc(100vh - 64px);
+
+    @include until($tablet) {
+      top: 56px;
+      left: 0;
+      width: 100%;
+      height: calc(100vh - 56px);
     }
   }
 

@@ -1,6 +1,8 @@
 const md = require('markdown-it')
 const mdAttrs = require('markdown-it-attrs')
+const mdDecorate = require('markdown-it-decorate')
 const _ = require('lodash')
+const underline = require('./underline')
 
 const quoteStyles = {
   Chinese: '””‘’',
@@ -26,17 +28,26 @@ module.exports = {
       typographer: this.config.typographer,
       quotes: _.get(quoteStyles, this.config.quotes, quoteStyles.English),
       highlight(str, lang) {
-        return `<pre><code class="language-${lang}">${_.escape(str)}</code></pre>`
+        if (lang === 'diagram') {
+          return `<pre class="diagram">` + Buffer.from(str, 'base64').toString() + `</pre>`
+        } else {
+          return `<pre><code class="language-${lang}">${_.escape(str)}</code></pre>`
+        }
       }
     })
+
+    if (this.config.underline) {
+      mkdown.use(underline)
+    }
 
     mkdown.use(mdAttrs, {
       allowedAttributes: ['id', 'class', 'target']
     })
+    mkdown.use(mdDecorate)
 
     for (let child of this.children) {
       const renderer = require(`../${_.kebabCase(child.key)}/renderer.js`)
-      renderer.init(mkdown, child.config)
+      await renderer.init(mkdown, child.config)
     }
 
     return mkdown.render(this.input)

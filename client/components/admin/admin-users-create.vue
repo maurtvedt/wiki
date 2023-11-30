@@ -11,7 +11,7 @@
       v-card-text.pt-5
         v-select(
           :items='providers'
-          item-text='title'
+          item-text='displayName'
           item-value='key'
           outlined
           prepend-icon='mdi-domain'
@@ -57,7 +57,8 @@
           prepend-icon='mdi-account-group'
           v-model='group'
           label='Assign to Group(s)...'
-          dense
+          hint='Note that you cannot assign users to the Administrators or Guests groups from this dialog.'
+          persistent-hint
           clearable
           multiple
           )
@@ -90,9 +91,9 @@
 <script>
 import _ from 'lodash'
 import validate from 'validate.js'
+import gql from 'graphql-tag'
 
 import createUserMutation from 'gql/admin/users/users-mutation-create.gql'
-import providersQuery from 'gql/admin/users/users-query-strategies.gql'
 import groupsQuery from 'gql/admin/users/users-query-groups.gql'
 
 export default {
@@ -211,7 +212,7 @@ export default {
         } else {
           this.$store.commit('showNotification', {
             style: 'red',
-            message: _.get(resp, 'data.users.create.responseResult.message', 'An unexpected error occured.'),
+            message: _.get(resp, 'data.users.create.responseResult.message', 'An unexpected error occurred.'),
             icon: 'alert'
           })
         }
@@ -226,9 +227,18 @@ export default {
   },
   apollo: {
     providers: {
-      query: providersQuery,
+      query: gql`
+        query {
+          authentication {
+            activeStrategies {
+              key
+              displayName
+            }
+          }
+        }
+      `,
       fetchPolicy: 'network-only',
-      update: (data) => data.authentication.strategies,
+      update: (data) => data.authentication.activeStrategies,
       watchLoading (isLoading) {
         this.$store.commit(`loading${isLoading ? 'Start' : 'Stop'}`, 'admin-users-strategies-refresh')
       }

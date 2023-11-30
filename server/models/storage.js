@@ -94,6 +94,14 @@ module.exports = class Storage extends Model {
       } else {
         WIKI.logger.info(`No new storage targets found: [ SKIPPED ]`)
       }
+
+      // -> Delete removed targets
+      for (const target of dbTargets) {
+        if (!_.some(WIKI.data.storage, ['key', target.key])) {
+          await WIKI.models.storage.query().where('key', target.key).del()
+          WIKI.logger.info(`Removed target ${target.key} because it is no longer present in the modules folder: [ OK ]`)
+        }
+      }
     } catch (err) {
       WIKI.logger.error(`Failed to scan or load new storage providers: [ FAILED ]`)
       WIKI.logger.error(err)
@@ -144,11 +152,11 @@ module.exports = class Storage extends Model {
           }
 
           // -> Set internal recurring sync job
-          if (targetDef.intervalSchedule && targetDef.intervalSchedule !== `P0D`) {
+          if (targetDef.internalSchedule && targetDef.internalSchedule !== `P0D`) {
             WIKI.scheduler.registerJob({
               name: `sync-storage`,
               immediate: false,
-              schedule: target.intervalSchedule,
+              schedule: target.internalSchedule,
               repeat: true
             }, target.key)
           }
@@ -191,11 +199,28 @@ module.exports = class Storage extends Model {
     }
   }
 
+  static async getLocalLocations({ asset }) {
+    const locations = []
+    const promises = this.targets.map(async (target) => {
+      try {
+        const path = await target.fn.getLocalLocation(asset)
+        locations.push({
+          path,
+          key: target.key
+        })
+      } catch (err) {
+        WIKI.logger.warn(err)
+      }
+    })
+    await Promise.all(promises)
+    return locations
+  }
+
   static async executeAction(targetKey, handler) {
     try {
       const target = _.find(this.targets, ['key', targetKey])
       if (target) {
-        if (_.has(target.fn, handler)) {
+        if (_.hasIn(target.fn, handler)) {
           await target.fn[handler]()
         } else {
           throw new Error('Invalid Handler for Storage Target')
